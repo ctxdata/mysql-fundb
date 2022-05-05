@@ -67,6 +67,10 @@ class ha_fun : public handler {
   THR_LOCK_DATA lock;          ///< MySQL lock
   Fun_share *share;        ///< Shared lock info
   Fun_share *get_share();  ///< Get the share
+  my_off_t current_position;   /* Current position in the file during a file scan */
+  my_off_t next_position; /* Next position in the file scan */
+  String buffer;
+  uchar byte_buffer[IO_SIZE];
 
  public:
   ha_fun(handlerton *hton, TABLE_SHARE *table_arg);
@@ -95,7 +99,8 @@ class ha_fun : public handler {
     implements. The current table flags are documented in handler.h
   */
   ulonglong table_flags() const override {
-    return HA_BINLOG_STMT_CAPABLE;
+    return (HA_NO_TRANSACTIONS | HA_NO_AUTO_INCREMENT | HA_BINLOG_ROW_CAPABLE |
+            HA_BINLOG_STMT_CAPABLE | HA_CAN_REPAIR);
   }
 
   /** @brief
