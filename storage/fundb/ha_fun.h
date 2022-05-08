@@ -47,7 +47,6 @@
 #include "thr_lock.h"    /* THR_LOCK, THR_LOCK_DATA */
 #include "sql_string.h"
 #include <map>
-using namespace std;
 
 /** @brief
   Fun_share is a class that will be shared among all open handlers.
@@ -56,6 +55,13 @@ using namespace std;
 class Fun_share : public Handler_share {
  public:
   THR_LOCK lock;
+  mysql_mutex_t mutex;
+  bool fd_write_opened;
+  char *table_name;
+  char data_file_name[FN_REFLEN];
+  uint table_name_length, use_count;
+  File fundb_write_fd; /* File handler for readers */
+  bool crashed;
   Fun_share();
   ~Fun_share() override { thr_lock_delete(&lock); }
 };
@@ -66,7 +72,7 @@ class Fun_share : public Handler_share {
 class ha_fun : public handler {
   THR_LOCK_DATA lock;          ///< MySQL lock
   Fun_share *share;        ///< Shared lock info
-  Fun_share *get_share();  ///< Get the share
+  Fun_share *get_share(const char *table_name);  ///< Get the share
   my_off_t current_position;   /* Current position in the file during a file scan */
   my_off_t next_position; /* Next position in the file scan */
   String buffer;
@@ -75,6 +81,12 @@ class ha_fun : public handler {
  public:
   ha_fun(handlerton *hton, TABLE_SHARE *table_arg);
   ~ha_fun() override = default;
+
+  /**
+   * @brief initialize file writer
+   * 
+   */
+  int init_fd_writer();
 
   /** @brief
     The name that will be used for display purposes.
@@ -99,8 +111,7 @@ class ha_fun : public handler {
     implements. The current table flags are documented in handler.h
   */
   ulonglong table_flags() const override {
-    return (HA_NO_TRANSACTIONS | HA_NO_AUTO_INCREMENT | HA_BINLOG_ROW_CAPABLE |
-            HA_BINLOG_STMT_CAPABLE | HA_CAN_REPAIR);
+    return (HA_NO_TRANSACTIONS | HA_BINLOG_STMT_CAPABLE);
   }
 
   /** @brief
@@ -139,7 +150,7 @@ class ha_fun : public handler {
     There is no need to implement ..._key_... methods if your engine doesn't
     support indexes.
    */
-  uint max_supported_keys() const override { return 0; }
+  uint max_supported_keys() const override { return 1; }
 
   /** @brief
     unireg.cc will call this to make sure that the storage engine can handle
@@ -150,7 +161,7 @@ class ha_fun : public handler {
     There is no need to implement ..._key_... methods if your engine doesn't
     support indexes.
    */
-  uint max_supported_key_parts() const override { return 0; }
+  uint max_supported_key_parts() const override { return 1; }
 
   /** @brief
     unireg.cc will call this to make sure that the storage engine can handle
@@ -161,7 +172,7 @@ class ha_fun : public handler {
     There is no need to implement ..._key_... methods if your engine doesn't
     support indexes.
    */
-  uint max_supported_key_length() const override { return 0; }
+  uint max_supported_key_length() const override { return MAX_KEY_LENGTH; }
 
   /** @brief
     Called in test_quick_select to determine if indexes should be used.

@@ -98,6 +98,8 @@
 #include "mysql/plugin.h"
 #include "sql/table.h"
 #include "sql/field.h"
+#include "mysql/psi/mysql_file.h"
+#include "mysql/psi/mysql_memory.h"
 #include "sql/sql_class.h"
 #include "sql/sql_plugin.h"
 #include "typelib.h"
@@ -114,6 +116,10 @@ static bool fun_is_supported_system_table(const char *db,
                                               bool is_sql_layer_system_table);
 
 Fun_share::Fun_share() { thr_lock_init(&lock); }
+
+mysql_mutex_t fundb_mutex;
+
+static PSI_file_key fundb_key_file_data;
 
 static int fun_init_func(void *p) {
   DBUG_TRACE;
@@ -136,7 +142,7 @@ static int fun_init_func(void *p) {
   they are needed to function.
 */
 
-Fun_share *ha_fun::get_share() {
+Fun_share *ha_fun::get_share(const char *table_name) {
   Fun_share *tmp_share;
 
   DBUG_TRACE;
@@ -145,9 +151,12 @@ Fun_share *ha_fun::get_share() {
   if (!(tmp_share = static_cast<Fun_share *>(get_ha_share_ptr()))) {
     tmp_share = new Fun_share;
     if (!tmp_share) goto err;
+    tmp_share->use_count = 0;
 
     set_ha_share_ptr(static_cast<Handler_share *>(tmp_share));
   }
+
+  fn_format(tmp_share->data_file_name, table_name, "", ".fdb", MY_REPLACE_EXT | MY_UNPACK_FILENAME);
 err:
   unlock_shared_ha_data();
   return tmp_share;
@@ -224,7 +233,7 @@ static bool fun_is_supported_system_table(const char *db,
 int ha_fun::open(const char *name, int, uint, const dd::Table *tbl) {
   DBUG_TRACE;
 
-  if (!(share = get_share())) return 1;
+  if (!(share = get_share(name))) return 1;
   thr_lock_data_init(&share->lock, &lock, nullptr);
 
   return 0;
@@ -247,8 +256,11 @@ int ha_fun::open(const char *name, int, uint, const dd::Table *tbl) {
 
 int ha_fun::close(void) {
   DBUG_TRACE;
-  delete share;
-  return 0;
+
+  int rc = mysql_file_close(share->fundb_write_fd, MYF(0));
+  share->fd_write_opened = false;
+  
+  return rc;
 }
 
 /**
@@ -282,20 +294,19 @@ int ha_fun::close(void) {
 */
 
 int ha_fun::write_row(uchar *buf) {
-  char name_buff[FN_REFLEN];
   DBUG_TRACE;
   /*
-    Fun of a successful write_row. We don't store the data
+    Example of a successful write_row. We don't store the data
     anywhere; they are thrown away. A real implementation will
     probably need to do something with 'buf'. We report a success
     here, to pretend that the insert was successful.
   */
 
-  ha_statistic_increment(&System_status_var::ha_write_count);
-
   char attribute_buffer[1024];
   String attribute(attribute_buffer, sizeof(attribute_buffer), &my_charset_bin);
-  buffer[0] = 0;
+
+  my_bitmap_map *org_bitmap = dbug_tmp_use_all_columns(table, table->read_set);
+  buffer.length(0);
 
   for (Field **field = table->field; *field; field++) {
     const char *ptr;
@@ -310,29 +321,43 @@ int ha_fun::write_row(uchar *buf) {
       (*field)->set_default();
       (*field)->set_notnull();
     }
-
+    
     (*field)->val_str(&attribute, &attribute);
 
     if (was_null) (*field)->set_null();
 
     buffer.append(attribute);
-
     buffer.append(',');
   }
-  // Remove the comma, add a line feed
-  buffer.length(buffer.length() - 1);
-  buffer.append('\n');
 
-  // buffer.replace(buffer.length(), 0, "\n", 1);
-  FILE* pF = nullptr;
+  buffer[buffer.length()-1] = '\n';
+  dbug_tmp_restore_column_map(table->read_set, org_bitmap);
 
-  if (!(pF= my_fopen(fn_format(name_buff, "funtest", "", ".fdb", MY_REPLACE_EXT|MY_UNPACK_FILENAME), O_RDWR | O_TRUNC, MYF(MY_WME))))
+  if (!share->fd_write_opened)
+    if (init_fd_writer()) 
+      return -1;
+
+  /* use pwrite, as concurrent reader could have changed the position */
+  if (mysql_file_write(share->fundb_write_fd,
+                       pointer_cast<const uchar *>(buffer.ptr()), buffer.length(),
+                       MYF(MY_WME | MY_NABP)))
     return -1;
 
-  if (my_fwrite(pF, (const uchar *)buffer.ptr(), buffer.length(), MYF(MY_WME)) < 0)
-    return -1;
-  
-  my_fclose(pF, MYF(MY_WME));
+  return 0;
+}
+
+int ha_fun::init_fd_writer() {
+  DBUG_TRACE;
+
+  if ((share->fundb_write_fd =
+           mysql_file_open(fundb_key_file_data, share->data_file_name,
+                           O_RDWR | O_APPEND, MYF(MY_WME))) == -1) {
+    DBUG_PRINT("info", ("Could not open tina file writes"));
+    share->crashed = true;
+    return my_errno() ? my_errno() : -1;
+  }
+  share->fd_write_opened = true;
+
   return 0;
 }
 
@@ -798,12 +823,12 @@ int ha_fun::create(const char *name, TABLE *table_arg, HA_CREATE_INFO *,
   DBUG_ENTER("ha_fun::create");
 
   /*
-    check columns
+    check columns, we don't allow any column to be nullable
   */
   for (Field **field = table_arg->s->field; *field; field++) {
     if ((*field)->is_nullable()) {
       my_error(ER_CHECK_NOT_IMPLEMENTED, MYF(0), "nullable columns");
-      return HA_ERR_UNSUPPORTED;
+      DBUG_RETURN(HA_ERR_UNSUPPORTED);
     }
   }
 
@@ -813,8 +838,6 @@ int ha_fun::create(const char *name, TABLE *table_arg, HA_CREATE_INFO *,
   DBUG_RETURN(-1);
 
   my_close(create_file, MYF(0));
-
-  DBUG_RETURN(0);
 
   /*
     It's just an fun of THDVAR_SET() usage below.
@@ -829,7 +852,7 @@ int ha_fun::create(const char *name, TABLE *table_arg, HA_CREATE_INFO *,
   uint count = THDVAR(thd, create_count_thdvar) + 1;
   THDVAR_SET(thd, create_count_thdvar, &count);
 
-  return 0;
+  DBUG_RETURN(0);
 }
 
 struct st_mysql_storage_engine fun_storage_engine = {
