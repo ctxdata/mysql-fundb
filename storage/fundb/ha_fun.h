@@ -111,7 +111,8 @@ class ha_fun : public handler {
     implements. The current table flags are documented in handler.h
   */
   ulonglong table_flags() const override {
-    return (HA_NO_TRANSACTIONS | HA_BINLOG_STMT_CAPABLE);
+    return (HA_NO_TRANSACTIONS | HA_NO_AUTO_INCREMENT | HA_BINLOG_ROW_CAPABLE |
+             HA_BINLOG_STMT_CAPABLE | HA_CAN_REPAIR);
   }
 
   /** @brief

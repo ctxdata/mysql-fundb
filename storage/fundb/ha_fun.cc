@@ -294,13 +294,9 @@ int ha_fun::close(void) {
 */
 
 int ha_fun::write_row(uchar *buf) {
-  DBUG_TRACE;
-  /*
-    Example of a successful write_row. We don't store the data
-    anywhere; they are thrown away. A real implementation will
-    probably need to do something with 'buf'. We report a success
-    here, to pretend that the insert was successful.
-  */
+  DBUG_ENTER("ha_fun::write_row");
+  
+  ha_statistic_increment(&System_status_var::ha_write_count);
 
   char attribute_buffer[1024];
   String attribute(attribute_buffer, sizeof(attribute_buffer), &my_charset_bin);
@@ -309,41 +305,25 @@ int ha_fun::write_row(uchar *buf) {
   buffer.length(0);
 
   for (Field **field = table->field; *field; field++) {
-    const char *ptr;
-    const char *end_ptr;
-    const bool was_null = (*field)->is_null();
-
-    /*
-      assistance for backwards compatibility in production builds.
-      note: this will not work for ENUM columns.
-    */
-    if (was_null) {
-      (*field)->set_default();
-      (*field)->set_notnull();
-    }
-    
     (*field)->val_str(&attribute, &attribute);
-
-    if (was_null) (*field)->set_null();
-
     buffer.append(attribute);
     buffer.append(',');
   }
 
+  // replace the extra ',' into '\n' to make sure each row is stored within a single line
   buffer[buffer.length()-1] = '\n';
   dbug_tmp_restore_column_map(table->read_set, org_bitmap);
 
   if (!share->fd_write_opened)
     if (init_fd_writer()) 
-      return -1;
+      DBUG_RETURN(-1);
 
-  /* use pwrite, as concurrent reader could have changed the position */
   if (mysql_file_write(share->fundb_write_fd,
                        pointer_cast<const uchar *>(buffer.ptr()), buffer.length(),
                        MYF(MY_WME | MY_NABP)))
-    return -1;
+    DBUG_RETURN(-1);
 
-  return 0;
+  DBUG_RETURN(0);
 }
 
 int ha_fun::init_fd_writer() {
