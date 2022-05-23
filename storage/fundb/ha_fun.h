@@ -47,6 +47,9 @@
 #include "thr_lock.h"    /* THR_LOCK, THR_LOCK_DATA */
 #include "sql_string.h"
 #include <map>
+#include "storage/fundb/fundb.h"
+
+//#include "fun_tbl_file.h"
 
 /** @brief
   Fun_share is a class that will be shared among all open handlers.
@@ -59,10 +62,15 @@ class Fun_share : public Handler_share {
   bool fd_write_opened;
   char *table_name;
   char data_file_name[FN_REFLEN];
+  char meta_file_name[FN_REFLEN];
+  fundb_table *fun_table;
+  row_iterator it;
   uint table_name_length, use_count;
-  File fundb_write_fd; /* File handler for readers */
+  File fundb_data_fd; /* File handler for readers */
+  File fundb_meta_fd; /* File handler for readers */
+  //tbl_file file;
   bool crashed;
-  Fun_share();
+  Fun_share(const char *table_name);
   ~Fun_share() override { thr_lock_delete(&lock); }
 };
 
@@ -75,6 +83,7 @@ class ha_fun : public handler {
   Fun_share *get_share(const char *table_name);  ///< Get the share
   my_off_t current_position;   /* Current position in the file during a file scan */
   my_off_t next_position; /* Next position in the file scan */
+  bool records_is_known;
   String buffer;
   uchar byte_buffer[IO_SIZE];
 
@@ -82,11 +91,7 @@ class ha_fun : public handler {
   ha_fun(handlerton *hton, TABLE_SHARE *table_arg);
   ~ha_fun() override = default;
 
-  /**
-   * @brief initialize file writer
-   * 
-   */
-  int init_fd_writer();
+  int find_current_row(uchar *buf);
 
   /** @brief
     The name that will be used for display purposes.

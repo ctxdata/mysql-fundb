@@ -104,29 +104,63 @@
 #include "sql/sql_plugin.h"
 #include "typelib.h"
 #include "my_sys.h"
+#include "map_helpers.h"
+#include <stdlib.h>
+#include "sql_string.h"
+
+using std::string;
+using std::unique_ptr;
 
 static handler *fun_create_handler(handlerton *hton, TABLE_SHARE *table,
                                        bool partitioned, MEM_ROOT *mem_root);
 
 handlerton *fun_hton;
 
+static unique_ptr<collation_unordered_multimap<string, Fun_share*>> open_tables;
+
 /* Interface to mysqld, to check system tables supported by SE */
 static bool fun_is_supported_system_table(const char *db,
                                               const char *table_name,
                                               bool is_sql_layer_system_table);
 
-Fun_share::Fun_share() { thr_lock_init(&lock); }
+Fun_share::Fun_share(const char *table_name) {
+  thr_lock_init(&lock);
+  fun_table = new fundb_table(table_name);
+}
 
 mysql_mutex_t fundb_mutex;
 
+static const char *ha_fundb_exts[] = {FDB_EXT, FMD_EXT, NullS};
+
 static PSI_file_key fundb_key_file_data;
+
+static PSI_memory_key fundb_key_memory_share;
+
+static PSI_memory_info all_fundb_memory[] = {
+    {&fundb_key_memory_share, "Fun_share", PSI_FLAG_ONLY_GLOBAL_STAT, 0,
+     PSI_DOCUMENT_ME}};
+
+static void init_fundb_psi_keys(void) {
+  const char *category = "fundb";
+  int count;
+
+  count = static_cast<int>(array_elements(all_fundb_memory));
+  mysql_memory_register(category, all_fundb_memory, count);
+}
 
 static int fun_init_func(void *p) {
   DBUG_TRACE;
 
+  #ifdef HAVE_PSI_INTERFACE
+    init_fundb_psi_keys();
+  #endif
+
+  open_tables.reset(new collation_unordered_multimap<string, Fun_share *>(
+      system_charset_info, fundb_key_memory_share));
   fun_hton = (handlerton *)p;
   fun_hton->state = SHOW_OPTION_YES;
   fun_hton->db_type = DB_TYPE_FUNDB;
+  fun_hton->file_extensions = ha_fundb_exts;
   fun_hton->create = fun_create_handler;
   fun_hton->flags = (HTON_CAN_RECREATE | HTON_SUPPORT_LOG_TABLES | HTON_NO_PARTITION);
   fun_hton->is_supported_system_table = fun_is_supported_system_table;
@@ -148,15 +182,20 @@ Fun_share *ha_fun::get_share(const char *table_name) {
   DBUG_TRACE;
 
   lock_shared_ha_data();
-  if (!(tmp_share = static_cast<Fun_share *>(get_ha_share_ptr()))) {
-    tmp_share = new Fun_share;
+  const auto it = open_tables->find(table_name);
+  if (it == open_tables->end()) {
+    tmp_share = new Fun_share(table_name);
     if (!tmp_share) goto err;
     tmp_share->use_count = 0;
 
-    set_ha_share_ptr(static_cast<Handler_share *>(tmp_share));
-  }
+    fn_format(tmp_share->meta_file_name, table_name, "", FMD_EXT, MY_REPLACE_EXT|MY_UNPACK_FILENAME);
 
-  fn_format(tmp_share->data_file_name, table_name, "", ".fdb", MY_REPLACE_EXT | MY_UNPACK_FILENAME);
+    fn_format(tmp_share->data_file_name, table_name, "", FDB_EXT, MY_REPLACE_EXT|MY_UNPACK_FILENAME);
+
+    open_tables->emplace(table_name, tmp_share);
+  } else {
+    tmp_share = it->second;
+  }
 err:
   unlock_shared_ha_data();
   return tmp_share;
@@ -168,7 +207,7 @@ static handler *fun_create_handler(handlerton *hton, TABLE_SHARE *table,
 }
 
 ha_fun::ha_fun(handlerton *hton, TABLE_SHARE *table_arg)
-    : handler(hton, table_arg) {
+    : handler(hton, table_arg), records_is_known(false) {
   buffer.set((char *)byte_buffer, IO_SIZE, &my_charset_bin);
 }
 
@@ -236,6 +275,8 @@ int ha_fun::open(const char *name, int, uint, const dd::Table *tbl) {
   if (!(share = get_share(name))) return 1;
   thr_lock_data_init(&share->lock, &lock, nullptr);
 
+  share->fun_table->open();
+
   return 0;
 }
 
@@ -257,10 +298,9 @@ int ha_fun::open(const char *name, int, uint, const dd::Table *tbl) {
 int ha_fun::close(void) {
   DBUG_TRACE;
 
-  int rc = mysql_file_close(share->fundb_write_fd, MYF(0));
-  share->fd_write_opened = false;
+  share->fun_table->close();
   
-  return rc;
+  return 0;
 }
 
 /**
@@ -303,42 +343,21 @@ int ha_fun::write_row(uchar *buf) {
 
   my_bitmap_map *org_bitmap = dbug_tmp_use_all_columns(table, table->read_set);
   buffer.length(0);
+  uint32_t id;
+  uint64_t val;
 
   for (Field **field = table->field; *field; field++) {
-    (*field)->val_str(&attribute, &attribute);
-    buffer.append(attribute);
-    buffer.append(',');
+    if (strcmp("id", (*field)->field_name) == 0) {
+      id = (uint32_t)(*field)->val_int();
+    } else {
+      val = (*field)->val_int();
+    }
   }
-
-  // replace the extra ',' into '\n' to make sure each row is stored within a single line
-  buffer[buffer.length()-1] = '\n';
   dbug_tmp_restore_column_map(table->read_set, org_bitmap);
 
-  if (!share->fd_write_opened)
-    if (init_fd_writer()) 
-      DBUG_RETURN(-1);
-
-  if (mysql_file_write(share->fundb_write_fd,
-                       pointer_cast<const uchar *>(buffer.ptr()), buffer.length(),
-                       MYF(MY_WME | MY_NABP)))
-    DBUG_RETURN(-1);
+  share->fun_table->add(id, val);
 
   DBUG_RETURN(0);
-}
-
-int ha_fun::init_fd_writer() {
-  DBUG_TRACE;
-
-  if ((share->fundb_write_fd =
-           mysql_file_open(fundb_key_file_data, share->data_file_name,
-                           O_RDWR | O_APPEND, MYF(MY_WME))) == -1) {
-    DBUG_PRINT("info", ("Could not open tina file writes"));
-    share->crashed = true;
-    return my_errno() ? my_errno() : -1;
-  }
-  share->fd_write_opened = true;
-
-  return 0;
 }
 
 /**
@@ -390,8 +409,20 @@ int ha_fun::update_row(const uchar *, uchar *) {
 */
 
 int ha_fun::delete_row(const uchar *) {
-  DBUG_TRACE;
-  return HA_ERR_WRONG_COMMAND;
+  DBUG_ENTER("ha_fun::delete_row");
+  uint32_t id;
+  uint64_t val;
+
+  for (Field **field = table->field; *field; field++) {
+    if (strcmp("id", (*field)->field_name) == 0) {
+      id = (uint32_t)(*field)->val_int();
+    } else {
+      val = (*field)->val_int();
+    }
+  }
+
+  share->fun_table->remove(id, val);
+  DBUG_RETURN(0);
 }
 
 /**
@@ -482,13 +513,18 @@ int ha_fun::index_last(uchar *) {
   sql_update.cc
 */
 int ha_fun::rnd_init(bool scan) {
-  DBUG_TRACE;
-  current_position = next_position = 0;
-  return 0;
+  DBUG_ENTER("ha_fun::rnd_init");
+  stats.records = 0;
+  records_is_known = false;
+
+  share->it = share->fun_table->begin();
+
+  DBUG_RETURN(0);
 }
 
 int ha_fun::rnd_end() {
   DBUG_TRACE;
+  records_is_known = true;
   return 0;
 }
 
@@ -507,11 +543,45 @@ int ha_fun::rnd_end() {
   filesort.cc, records.cc, sql_handler.cc, sql_select.cc, sql_table.cc and
   sql_update.cc
 */
-int ha_fun::rnd_next(uchar *) {
-  int rc;
-  DBUG_TRACE;
-  rc = HA_ERR_END_OF_FILE;
-  return rc;
+int ha_fun::rnd_next(uchar *buf) {
+  DBUG_ENTER("ha_fun::rnd_next");
+
+  if (HA_ERR_END_OF_FILE == find_current_row(buf) )
+     DBUG_RETURN(HA_ERR_END_OF_FILE);
+
+  stats.records++;
+  DBUG_RETURN(0);
+}
+
+int ha_fun::find_current_row(uchar *buf) {
+  DBUG_ENTER("ha_fun::find_current_row");
+  
+  if (share->it == share->fun_table->end()) {
+    DBUG_RETURN(HA_ERR_END_OF_FILE);
+  }
+
+  my_bitmap_map *org_bitmap;
+  org_bitmap = dbug_tmp_use_all_columns(table, table->write_set);
+  std::tuple<uint32_t, uint32_t> row = *share->it;
+  uint32_t id = std::get<0>(row);
+  uint32_t val = std::get<1>(row);
+
+  String buffer(16);
+
+  for (Field **field = table->field; *field; field++) {
+    buffer.length(0);
+    if (strcmp("id", (*field)->field_name) == 0) {
+      buffer.append_longlong(id);
+      (*field)->store(buffer.c_ptr(), buffer.length(), (*field)->charset(), CHECK_FIELD_WARN);
+    } else {
+      buffer.append_longlong(val);
+      (*field)->store(buffer.c_ptr(), buffer.length(), (*field)->charset(), CHECK_FIELD_WARN);
+    }
+  }
+
+  share->it++;
+  dbug_tmp_restore_column_map(table->write_set, org_bitmap);
+  DBUG_RETURN(0);
 }
 
 /**
@@ -598,6 +668,8 @@ int ha_fun::rnd_pos(uchar *, uchar *) {
 */
 int ha_fun::info(uint) {
   DBUG_TRACE;
+  if (!records_is_known && stats.records < 2) 
+     stats.records= 2;
   return 0;
 }
 
@@ -634,7 +706,7 @@ int ha_fun::extra(enum ha_extra_function) {
   mysql_delete() in sql_delete.cc;
   JOIN::reinit() in sql_select.cc and
   st_query_block_query_expression::exec() in sql_union.cc.
-*/
+*/ 
 int ha_fun::delete_all_rows() {
   DBUG_TRACE;
   return HA_ERR_WRONG_COMMAND;
@@ -728,6 +800,8 @@ THR_LOCK_DATA **ha_fun::store_lock(THD *, THR_LOCK_DATA **to,
 int ha_fun::delete_table(const char *, const dd::Table *) {
   DBUG_TRACE;
   /* This is not implemented but we want someone to be able that it works. */
+  share->fun_table->drop();
+
   return 0;
 }
 
@@ -812,12 +886,22 @@ int ha_fun::create(const char *name, TABLE *table_arg, HA_CREATE_INFO *,
     }
   }
 
-  if ((create_file= my_create(fn_format(name_buff, name, "", ".fdb",
-        MY_REPLACE_EXT|MY_UNPACK_FILENAME),0,
-        O_RDWR | O_TRUNC,MYF(MY_WME))) < 0)
-  DBUG_RETURN(-1);
+  if (!(share = get_share(name))) return 1;
+
+  share->fun_table->create();
+
+  /*
+  if ((create_file= my_create(fn_format(name_buff, name, "", FDB_EXT, MY_REPLACE_EXT|MY_UNPACK_FILENAME),
+                            0, O_RDWR | O_TRUNC,MYF(MY_WME))) < 0)
+    DBUG_RETURN(-1);
 
   my_close(create_file, MYF(0));
+
+  if ((create_file= my_create(fn_format(name_buff, name, "", FMD_EXT, MY_REPLACE_EXT|MY_UNPACK_FILENAME),
+                            0, O_RDWR | O_TRUNC,MYF(MY_WME))) < 0)
+    DBUG_RETURN(-1);
+
+  my_close(create_file, MYF(0)); */
 
   /*
     It's just an fun of THDVAR_SET() usage below.
