@@ -21,3 +21,7 @@ So a SQL statement like `INSERT INTO tbl_user_messages VALUE(1, 8081)`, will be 
 |2|443,8080|
 
 I know this may seem ridiculous, but I believe the best way to understand a system is to add a new feature into it. I hope I can complete this experiment storage engine in next few months. Just do it!
+
+Step by Step to implement this custom Storage Engine
+----------------------------------
+Refer to [The birth of FunDB](https://ctxdata.github.io/the-birth-of-fundb/)
